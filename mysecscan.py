@@ -11,9 +11,11 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+formatter = logging.Formatter("%(asctime)s %(levelname)s mysescan %(message)s")
 handler.setFormatter(formatter)
-
+text_handler = logging.FileHandler("secscan.log")
+text_handler.setFormatter(formatter)
+logger.addHandler(text_handler)
 logger.addHandler(handler)
 
 
@@ -28,7 +30,7 @@ class Artifact(TypedDict):
     product_name: str
     version: str
     channel: str
-    target_type: str
+    target_type: TargetType
 
 
 def secscan_cmd(
@@ -51,26 +53,24 @@ def secscan_cmd(
         "--scanner",
         scanner,
         "--type",
-        artifact["target_type"],
+        artifact["target_type"].value,
         "--format",
         artifact["format"],
         "--wait-and-print",
     ]
 
-    if artifact["target_type"] != "container-image":
-        # oci have no channel and ssdlc parameter need to be all set or none
-        command.extend(
-            [
-                "--ssdlc-product-name",
-                artifact["product_name"],
-                "--ssdlc-cycle",
-                cycle,
-                "--ssdlc-product-version",
-                artifact["version"],
-                "--ssdlc-product-channel",
-                artifact["channel"],
-            ]
-        )
+    command.extend(
+        [
+            "--ssdlc-product-name",
+            artifact["product_name"],
+            "--ssdlc-cycle",
+            cycle,
+            "--ssdlc-product-version",
+            artifact["version"],
+            "--ssdlc-product-channel",
+            artifact["channel"],
+        ]
+    )
     command.append(target)
     return command
 
@@ -126,36 +126,58 @@ def snap_scan(snaps: list[Artifact], scanners: set, cycle: str) -> None:
     """
     for snap in snaps:
         snap_name = snap["product_name"]
+        file_name = f"./{snap_name}.snap"
+        try:
+            logger.info(f"Downloading {snap_name=} from {snap['channel']=}")
+            cmd = [
+                "snap",
+                "download",
+                "--channel",
+                snap["channel"],
+                "--basename",
+                snap_name,
+                snap_name,
+            ]
+            check_output(cmd)
+        except SubprocessError:
+            logger.exception(f"Failed to download {snap_name}. Skipping it")
+            sys.exit(1)
+
         for scanner in scanners:
             logger.info(f"Scanning {snap_name=} with {scanner=}")
             try:
-                check_output(secscan_cmd(snap, target=snap_name, scanner=scanner, cycle=cycle))
+                cmd = secscan_cmd(snap, target=file_name, scanner=scanner, cycle=cycle)
+                stdout = check_output(cmd, text=True)
             except SubprocessError:
                 logger.exception(f"Failed to scan {snap_name=} using {scanner=}")
                 sys.exit(1)
+
+            with open(f"snap_{snap_name}_{scanner}.report", "w") as fd:
+                fd.write(stdout)
 
 
 def oci_scan(rocks: list[Artifact], scanners: set, cycle: str) -> None:
     for rock in rocks:
         image_name = rock["product_name"]
-        registry = rock["channel"]
+        image = f"ghcr.io/canonical/{rock['product_name']}:{rock['channel'].replace('/', '_')}"
+
         tarball_name = f"./{image_name}.tar"
         pull_cmd = [
             "docker",
             "pull",
-            registry,
+            image,
         ]
         save_cmd = [
             "docker",
             "save",
             "-o",
             tarball_name,
-            registry,
+            image,
         ]
         try:
             logger.info(f"Pulling {image_name=}")
             check_output(pull_cmd)
-            logger.debug(f"Saving {image_name=} to tarball")
+            logger.info(f"Saving {image_name=} to tarball")
             check_output(save_cmd)
         except SubprocessError:
             logger.exception(f"Failed to pull or save {image_name=}. Skipping it")
@@ -164,15 +186,13 @@ def oci_scan(rocks: list[Artifact], scanners: set, cycle: str) -> None:
         for scanner in scanners:
             try:
                 logger.info(f"Scanning {image_name=} with {scanner=}")
-                stdout = check_output(
-                    secscan_cmd(
-                        rock,
-                        target=image_name,
-                        scanner=scanner,
-                        cycle=cycle,
-                    ),
-                    text=True,
+                cmd = secscan_cmd(
+                    rock,
+                    target=image,
+                    scanner=scanner,
+                    cycle=cycle,
                 )
+                stdout = check_output(cmd, text=True)
             except SubprocessError:
                 logger.exception(f"Failed to scan {image_name=} using {scanner=}")
                 sys.exit(1)
@@ -183,9 +203,8 @@ def oci_scan(rocks: list[Artifact], scanners: set, cycle: str) -> None:
 
 if __name__ == "__main__":
     scanners = {"blackduck", "osv", "trivy"}
-
     cycle = "25.10"
-    logger.info("Scanning charms")
+
     charms: list[Artifact] = [
         {
             "product_name": "mysql",
@@ -216,7 +235,6 @@ if __name__ == "__main__":
             "target_type": TargetType.CHARM,
         },
     ]
-    charm_scan(charms, scanners, cycle)
 
     snaps: list[Artifact] = [
         {
@@ -235,24 +253,25 @@ if __name__ == "__main__":
         },
     ]
 
-    logger.info("Scanning snaps")
-    snap_scan(snaps, scanners, cycle)
-
     rocks: list[Artifact] = [
         {
             "product_name": "charmed-mysql",
-            "channel": "ghcr.io/canonical/charmed-mysql:8.0.43-22.04_edge",
+            "channel": "8.0.43-22.04/edge",
             "version": "8.0.43",
             "format": "oci",
             "target_type": TargetType.ROCK,
         },
         {
             "product_name": "mysql",
-            "channel": "ghcr.io/canonical/mysql:8.0.43-24.04_edge",
+            "channel": "8.0.43-24.04/edge",
             "version": "8.0.43",
             "format": "oci",
             "target_type": TargetType.ROCK,
         },
     ]
+    logger.info("Scanning charms")
+    charm_scan(charms, scanners, cycle)
+    logger.info("Scanning snaps")
+    snap_scan(snaps, scanners, cycle)
     logger.info("Scanning OCI images")
     oci_scan(rocks, scanners, cycle)
